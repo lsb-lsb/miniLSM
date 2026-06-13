@@ -10,38 +10,9 @@
 
 ## 架构总览
 
-```
-                            ┌─────────────────┐
-                            │   Put / Delete   │
-                            └────────┬────────┘
-                                     │
-                            ┌────────▼────────┐
-                            │  WAL (CRC32)    │  ← 预写日志，崩溃恢复
-                            └────────┬────────┘
-                                     │
-                            ┌────────▼────────┐
-                            │    MemTable     │  ← SkipList 内存表
-                            │  (RefCounted)   │
-                            └────────┬────────┘
-                                     │ 写满后切换为 Immutable
-                            ┌────────▼────────┐
-                            │   Immutable     │  ← 后台 Flush，并发读安全
-                            │    MemTable     │
-                            └────────┬────────┘
-                                     │ 后台线程异步 Flush
-                            ┌────────▼────────┐
-                            │   SSTable L0    │  ← 磁盘有序表
-                            │  (Bloom + Index)│
-                            └────────┬────────┘
-                                     │ Compaction 多路归并
-                            ┌────────▼────────┐
-                            │   SSTable L1    │  ← 有序不重叠
-                            └─────────────────┘
-```
+数据写入时，先追加到预写日志（WAL）保证持久性，再插入内存中的 SkipList 跳表。MemTable 达到容量上限后被标记为不可变，由后台线程异步刷写到磁盘上的 SSTable 文件。SSTable 内部包含数据块、索引块和布隆过滤器，Level 0 的文件按写入顺序排列，经 Compaction 多路归并后进入 Level 1，Level 1 内的文件彼此 key 范围不重叠，支持二分查找。
 
-**写入路径**：Put → WAL 持久化 → SkipList 内存插入 → 立即返回
-**读取路径**：MemTable → Immutable MemTable → L0 SSTables (新→旧) → L1+ SSTables (二分定位 + Bloom Filter)
-**后台线程**：MemTable 写满 → 异步 Flush 到 L0 → L0 文件数达阈值 → L0+L1 多路归并 Compaction
+查询时按优先级依次搜索：当前 MemTable → 不可变 MemTable → Level 0 SSTable（从新到旧）→ Level 1+ SSTable（二分定位 + 布隆过滤）。一旦找到立即返回。
 
 ---
 
@@ -61,43 +32,15 @@
 
 ## 多线程架构
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                      前台线程 (用户)                       │
-│                                                          │
-│  Put(key, value):                    Get(key):            │
-│    lock(mutex_)                        lock(mutex_)       │
-│    ├─ WAL::AddRecord()                 ├─ mem_->Ref()     │
-│    ├─ mem_->Add()                      ├─ imm_->Ref()     │
-│    └─ unlock        ← 立即返回         ├─ SSTable->Ref()  │
-│                                        └─ unlock          │
-│                                           │               │
-│  Delete(key) = Put(key, "")             ├─ mem_->Get()    │
-│                                           ├─ imm_->Get()   │
-│                                           ├─ SSTable::Get()│
-│                                           └─ Unref all    │
-│                                              ↑            │
-│                                         快照读，磁盘 I/O   │
-│                                         不持锁，不阻塞写   │
-└──────────────────────────────────────────────────────────┘
-                              │
-                              │ bg_cv_.notify()
-                              ▼
-┌──────────────────────────────────────────────────────────┐
-│                    后台线程 (BackgroundWork)               │
-│                                                          │
-│  while (!shutting_down):                                 │
-│    wait(imm_ != nullptr || NeedCompaction)                │
-│                                                          │
-│    BackgroundFlush():           BackgroundCompaction():   │
-│      持锁取 imm_ 指针            持锁快照 L0/L1 + Ref     │
-│      → 解锁 I/O                  → 解锁多路归并 I/O       │
-│      → 持锁 levels_ push         → 持锁原子替换           │
-│      → WriteManifest             → WriteManifest          │
-└──────────────────────────────────────────────────────────┘
-```
+采用单写者模型加后台 Compaction 线程，核心思路是尽可能缩短锁的持有时间，把耗时的磁盘 I/O 放到锁外面做。
 
-**锁粒度优化**：写操作只持锁一瞬间（WAL + MemTable 写入），读操作的磁盘 I/O 完全不持锁（快照 + 引用计数保护），后台 Compaction 的归并 I/O 不持锁。
+**写入路径**：Put 和 Delete 全程持有全局 mutex，先追加 WAL 记录，再插入 MemTable 的 SkipList，然后立即释放锁返回。如果 MemTable 写满了，MakeRoomForWrite 会把当前 MemTable 标记为不可变（imm_），新建一个 MemTable 接管后续写入，通知后台线程来处理这个不可变 MemTable 的刷写。因为有 imm_flushing_ 标志保护，不可变 MemTable 在刷写期间仍然可以被前台读操作访问。
+
+**读取路径**：Get 采用三段式快照模式。第一步持锁瞬间：给当前 MemTable、不可变 MemTable、以及所有 SSTable 文件各自调用 Ref 增加引用计数，然后立即释放锁。第二步在无锁状态执行实际搜索：按优先级依次查询 MemTable → 不可变 MemTable → SSTable，这个过程涉及 SkipList 遍历和磁盘 I/O（Bloom Filter 检查、数据块读取），都不持有全局锁，不会阻塞写入。第三步释放所有快照引用。
+
+**后台 Compaction**：后台线程通过条件变量等待信号（imm_ 非空或者 L0 文件数达到阈值）。Flush 任务先持锁取到不可变 MemTable 指针，然后释放锁，在锁外完成 SSTable 构建和写盘，最后重新持锁将新 SSTable 加入 Level 0 并更新 MANIFEST。Compaction 任务类似：持锁拍一份 L0 和 L1 重叠文件的快照并 Ref，释放锁执行多路归并（小顶堆 MergeIterator），归并完成后持锁原子替换老文件、写入新文件到 Level 1。由于只删除快照中已知的文件，不会误删并发 Flush 新增的 SSTable。
+
+**引用计数生命周期**：SSTable 和 MemTable 都使用 atomic 引用计数。DB 自身持有一份原始引用，每个 Iterator 创建时 Ref、析构时 Unref，Get 快照读写期间也持有引用。当所有引用释放归零时，对象自动 delete 并释放文件资源。
 
 ---
 
