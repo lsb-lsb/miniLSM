@@ -1,0 +1,26 @@
+# Build output
+build/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test output directories
+test_db_*/
+sstable_test_*/
+wal_test_*/
+test_concurrency_*/
+
+# Object files
+*.o
+*.obj
+*.exe
+*.a
+*.lib
